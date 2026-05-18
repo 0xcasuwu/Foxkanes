@@ -5,3 +5,4 @@ pub mod vendor;
 
 pub mod animal_test;
 pub mod commitment_test;
+pub mod game_test;
