@@ -32,6 +32,7 @@
 use alkanes_runtime::{declare_alkane, message::MessageDispatch, runtime::AlkaneResponder};
 use alkanes_support::response::CallResponse;
 use anyhow::Result;
+use metashrew_support::compat::to_arraybuffer_layout;
 
 #[derive(Default)]
 pub struct FoxkanesGame(());
