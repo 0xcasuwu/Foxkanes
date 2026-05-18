@@ -1,0 +1,11 @@
+[package]
+name = "foxkanes-support"
+version = "0.1.0"
+edition = "2021"
+description = "Shared math helpers for Foxkanes — autonomous parameter formulas"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+foxkanes-constants = { workspace = true }

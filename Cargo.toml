@@ -1,0 +1,54 @@
+[package]
+name = "foxkanes"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+test = []
+testnet = []
+debug-log = []
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[workspace]
+members = [
+  "alkanes/*",
+  "crates/*"
+]
+
+[workspace.dependencies]
+alkanes-support = { git = "https://github.com/kungfuflex/alkanes-rs" }
+alkanes-runtime = { git = "https://github.com/kungfuflex/alkanes-rs" }
+alkanes-std-factory-support = { git = "https://github.com/kungfuflex/alkanes-rs" }
+metashrew-support = { git = "https://github.com/sandshrewmetaprotocols/metashrew" }
+protorune-support = { git = "https://github.com/kungfuflex/alkanes-rs" }
+ordinals = { git = "https://github.com/kungfuflex/alkanes-rs" }
+foxkanes-support = { path = "./crates/foxkanes-support" }
+foxkanes-constants = { path = "./crates/foxkanes-constants" }
+anyhow = "1.0.94"
+bitcoin = { version = "0.32.4", features = ["rand"] }
+hex = "0.4.3"
+num = "0.4.3"
+ruint = "1.13.1"
+
+[dependencies]
+alkanes-support = { workspace = true }
+alkanes-runtime = { workspace = true }
+metashrew-support = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", features = ["test-utils"] }
+metashrew-core = { git = "https://github.com/sandshrewmetaprotocols/metashrew", features = ["test-utils"] }
+protorune = { git = "https://github.com/kungfuflex/alkanes-rs", features = ["test-utils"] }
+protorune-support = { workspace = true }
+ordinals = { workspace = true }
+alkanes-support = { workspace = true }
+foxkanes-support = { workspace = true }
+bitcoin = { workspace = true }
+prost = "0.12"
+wasm-bindgen = "0.2.100"
+wasm-bindgen-test = "=0.3.50"
+web-sys = { version = "0.3", features = ["console"] }
+hex_lit = "0.1.1"

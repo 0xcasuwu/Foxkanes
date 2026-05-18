@@ -1,0 +1,11 @@
+[package]
+name = "foxkanes-constants"
+version = "0.1.0"
+edition = "2021"
+description = "Template IDs and forever-constants for the Foxkanes game protocol"
+
+[features]
+default = []
+testnet = []
+
+[dependencies]
