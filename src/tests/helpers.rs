@@ -17,11 +17,13 @@ pub use bitcoin::{transaction::Version, ScriptBuf, Sequence};
 pub use bitcoin::{Address, Amount, Block, Transaction, TxIn, TxOut, Witness};
 pub use metashrew_core::index_pointer::AtomicPointer;
 pub use ordinals::Runestone;
-pub use protorune::message::MessageContextParcel;
+pub use alkanes::message::AlkaneMessageContext;
+pub use protorune::message::{MessageContext, MessageContextParcel};
 pub use protorune::protostone::Protostones;
 pub use protorune::test_helpers::{create_block_with_coinbase_tx, get_address, ADDRESS1};
 pub use protorune_support::balance_sheet::BalanceSheet;
 pub use protorune_support::protostone::{Protostone, ProtostoneEdict};
+pub use alkanes_support::parcel::{AlkaneTransfer, AlkaneTransferParcel};
 pub use std::str::FromStr;
 
 pub use protorune_support::network::{set_network, NetworkParams};
@@ -208,6 +210,17 @@ pub fn create_operation_block(
     };
     block.txdata.push(tx);
     block
+}
+
+/// Advance the chain by indexing N empty (coinbase-only) blocks starting at
+/// `from_height`. Returns the next height to use.
+pub fn advance_blocks(from_height: u32, n: u32) -> Result<u32> {
+    for i in 0..n {
+        let h = from_height + i;
+        let blk = create_block_with_coinbase_tx(h);
+        index_block(&blk, h)?;
+    }
+    Ok(from_height + n)
 }
 
 /// Parse the first 16 LE bytes of response.data as a u128.

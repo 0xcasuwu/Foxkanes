@@ -189,6 +189,22 @@ pub const HUNT_MAX_AGING_BLOCKS: u64 = 10 * DAY; // 10 days = ceiling
 /// fire-bonding's spot price.
 pub const TWAP_WINDOW_DAYS: u128 = 7;
 
+// ---------- Yield model (v0, pending FIRE distribution wiring) ----------
+/// Yield units accrued per block per staked animal. Abstract unit until
+/// we wire to real FIRE staking distribution; for testability we use a
+/// deterministic constant. In production this will be replaced by a
+/// staticcall to fire-staking's GetCurrentEmissionRate (opcode 15).
+///
+/// Chosen to make multi-block yield computations land at round numbers
+/// in the test fixtures: 1000 units/block × 100 blocks = 100_000.
+pub const TEST_YIELD_PER_BLOCK_PER_STAKE: u128 = 1_000;
+
+/// Risky-claim seed salt — combined into the seed hash so the risky-claim
+/// coinflip can't be predicted from the same context that determined the
+/// lottery outcome. Distinct from REVEAL_DELAY and the lottery salts in
+/// foxkanes-support to keep entropy clean.
+pub const RISKY_CLAIM_SALT: u128 = 0xC0FFEE_FACE_FEEDu128;
+
 // ---------- Sanity / overflow protection ----------
 /// 1e8 — used for fixed-point math like fire-misha
 pub const PRECISION_SMALL: u128 = 100_000_000;

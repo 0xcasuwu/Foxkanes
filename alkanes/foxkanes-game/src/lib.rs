@@ -77,6 +77,62 @@ enum FoxkanesGameMessage {
     #[opcode(2)]
     Reveal,
 
+    /// Stake an animal NFT so it begins accruing yield. Caller presents
+    /// the animal NFT; game marks it as staked at current_height and
+    /// records the stake-block on the animal (reusing last_claim_block
+    /// since that's effectively "yield checkpoint" from here on). The
+    /// NFT is returned to the caller (bearer-token preserved).
+    #[opcode(3)]
+    Stake,
+
+    /// Safe-claim: a staked animal claims accrued yield. For farmers,
+    /// homeostatic tax is deducted and routed to the shared fox pool;
+    /// for foxes, the claim withdraws their share of the fox pool plus
+    /// any direct yield. Updates last_claim_block on the animal.
+    #[opcode(4)]
+    ClaimSafe,
+
+    /// Risky-claim: a 50/50 coinflip per RISKY_KEEP_PROBABILITY_BPS.
+    /// Win: caller receives the full pre-tax yield (no tax to fox pool).
+    /// Loss: caller receives nothing; ALL yield routes to the fox pool.
+    /// Updates last_claim_block on the animal either way.
+    #[opcode(5)]
+    ClaimRisky,
+
+    /// View: shared fox-pool balance (yield owed to foxes collectively).
+    #[opcode(20)]
+    #[returns(u128)]
+    GetFoxPool,
+
+    /// View: total fox-pool yield ever distributed (lifetime).
+    #[opcode(21)]
+    #[returns(u128)]
+    GetFoxPoolLifetime,
+
+    /// View: simulate yield owed to a staked animal as of current height,
+    /// pre-tax. Used by tests and front-ends; reads the animal's
+    /// last_claim_block via staticcall. Inputs: (animal_block, animal_tx).
+    #[opcode(22)]
+    #[returns(u128)]
+    PreviewYield {
+        animal_block: u128,
+        animal_tx: u128,
+    },
+
+    /// View: AlkaneId of the most-recently-spawned animal NFT. Returns
+    /// (block, tx) as 2 × u128 LE = 32 bytes. Useful for clients (and
+    /// tests) to discover which AlkaneId the runtime assigned after a
+    /// successful Reveal.
+    #[opcode(23)]
+    #[returns(Vec<u8>)]
+    GetLatestAnimalId,
+
+    /// View: AlkaneId of the most-recently-spawned commitment NFT.
+    /// Returns (block, tx) as 2 × u128 LE.
+    #[opcode(24)]
+    #[returns(Vec<u8>)]
+    GetLatestCommitmentId,
+
     // ── Open view opcodes ────────────────────────────────────────
 
     /// (fox_count, farmer_count) as 2 × u128 LE = 32 bytes
@@ -184,6 +240,69 @@ impl FoxkanesGame {
         StoragePointer::from_keyword(&format!("/cmt_child/{}/{}", id.block, id.tx))
     }
 
+    // ── Staking + tax pool storage ──────────────────────────────
+
+    /// Per-animal staked flag and the block they staked at. Stored in the
+    /// game (not on the animal) so the game's invariants on staked count
+    /// stay consistent; the animal's last_claim_block doubles as the yield
+    /// checkpoint.
+    fn animal_staked_pointer(&self, id: &AlkaneId) -> StoragePointer {
+        StoragePointer::from_keyword(&format!("/animal_staked/{}/{}", id.block, id.tx))
+    }
+
+    /// Count of currently-staked foxes — used as the denominator when a
+    /// farmer pays tax to update the fox-pool accumulator.
+    fn staked_fox_count_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/staked_fox_count")
+    }
+
+    /// Count of currently-staked farmers (informational; not used in the
+    /// hot path but useful for monitoring + later hunt-party gating).
+    fn staked_farmer_count_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/staked_farmer_count")
+    }
+
+    /// Synthetix-style accumulator: `tax_per_fox_acc = Σ (tax_paid × PRECISION / staked_fox_count_at_payment)`.
+    /// A fox's claim = `(current_acc - fox_checkpoint) / PRECISION` * 1.
+    /// PRECISION = foxkanes_constants::PRECISION = 1e18.
+    fn tax_per_fox_acc_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/tax_per_fox_acc")
+    }
+
+    /// Per-fox checkpoint of the accumulator at their last claim (or stake).
+    fn fox_acc_checkpoint_pointer(&self, id: &AlkaneId) -> StoragePointer {
+        StoragePointer::from_keyword(&format!("/fox_ck/{}/{}", id.block, id.tx))
+    }
+
+    /// Lifetime tax distributed to the fox pool, for monitoring/views.
+    fn fox_pool_lifetime_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/fox_pool_lifetime")
+    }
+
+    /// Aggregate undistributed pool balance — view-only, useful for UIs.
+    /// Tracks (sum of farmer-paid taxes since genesis) - (sum of fox claims).
+    fn fox_pool_balance_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/fox_pool_balance")
+    }
+
+    /// Most-recently-spawned animal AlkaneId — stored as two u128 cells
+    /// to avoid Arc<Vec<u8>> semantics that have proven flaky in mid-handler
+    /// writes (initial Arc::new approach didn't persist to view reads).
+    fn latest_animal_id_block_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/latest_animal_id_block")
+    }
+    fn latest_animal_id_tx_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/latest_animal_id_tx")
+    }
+
+    /// Most-recently-spawned commitment AlkaneId.
+    fn latest_commitment_id_block_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/latest_commitment_id_block")
+    }
+    fn latest_commitment_id_tx_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/latest_commitment_id_tx")
+    }
+
     // ── Field readers ────────────────────────────────────────────
 
     fn animal_template(&self) -> u128 {
@@ -235,6 +354,70 @@ impl FoxkanesGame {
     }
     fn is_registered_commitment(&self, id: &AlkaneId) -> bool {
         self.commitment_child_pointer(id).get_value::<u128>() == 1
+    }
+
+    // ── Staking state readers ───────────────────────────────────
+
+    fn is_staked(&self, id: &AlkaneId) -> bool {
+        self.animal_staked_pointer(id).get_value::<u128>() == 1
+    }
+    fn staked_fox_count(&self) -> u128 {
+        self.staked_fox_count_pointer().get_value::<u128>()
+    }
+    fn staked_farmer_count(&self) -> u128 {
+        self.staked_farmer_count_pointer().get_value::<u128>()
+    }
+    fn tax_per_fox_acc(&self) -> u128 {
+        self.tax_per_fox_acc_pointer().get_value::<u128>()
+    }
+    fn fox_acc_checkpoint(&self, id: &AlkaneId) -> u128 {
+        self.fox_acc_checkpoint_pointer(id).get_value::<u128>()
+    }
+    fn fox_pool_balance(&self) -> u128 {
+        self.fox_pool_balance_pointer().get_value::<u128>()
+    }
+    fn fox_pool_lifetime(&self) -> u128 {
+        self.fox_pool_lifetime_pointer().get_value::<u128>()
+    }
+
+    /// Read an animal's full state via staticcall to its op 23 GetAllDetails.
+    /// Returns (animal_id, role, birth_block, lifespan, accumulated_taxes,
+    /// last_claim_block, is_dead, hunt_in_progress).
+    fn read_animal(
+        &self,
+        id: &AlkaneId,
+    ) -> Result<(u128, u128, u128, u128, u128, u128, u128, u128)> {
+        let call = Cellpack {
+            target: id.clone(),
+            inputs: vec![23],
+        };
+        let resp = self.staticcall(&call, &AlkaneTransferParcel::default(), self.fuel())?;
+        if resp.data.len() < 16 * 8 {
+            return Err(anyhow!(
+                "animal GetAllDetails returned {} bytes, want 128",
+                resp.data.len()
+            ));
+        }
+        Ok((
+            u128::from_le_bytes(resp.data[0..16].try_into()?),
+            u128::from_le_bytes(resp.data[16..32].try_into()?),
+            u128::from_le_bytes(resp.data[32..48].try_into()?),
+            u128::from_le_bytes(resp.data[48..64].try_into()?),
+            u128::from_le_bytes(resp.data[64..80].try_into()?),
+            u128::from_le_bytes(resp.data[80..96].try_into()?),
+            u128::from_le_bytes(resp.data[96..112].try_into()?),
+            u128::from_le_bytes(resp.data[112..128].try_into()?),
+        ))
+    }
+
+    /// Vault-only write helper: set the animal's last_claim_block via op 1.
+    fn write_animal_last_claim(&self, id: &AlkaneId, new_block: u128) -> Result<()> {
+        let call = Cellpack {
+            target: id.clone(),
+            inputs: vec![1u128, new_block], // SetLastClaimBlock
+        };
+        self.call(&call, &AlkaneTransferParcel::default(), self.fuel())?;
+        Ok(())
     }
 
     /// Compute lottery day id from current height. day 0 starts at
@@ -355,6 +538,11 @@ impl FoxkanesGame {
         }
         let commitment_nft = create_response.alkanes.0[0].clone();
         self.register_commitment(&commitment_nft.id);
+        // Record latest id (block, tx) as two u128 cells.
+        self.latest_commitment_id_block_pointer()
+            .set_value(commitment_nft.id.block);
+        self.latest_commitment_id_tx_pointer()
+            .set_value(commitment_nft.id.tx);
         self.commitment_seq_pointer().set_value(commitment_id + 1);
 
         // 4. Return the commitment NFT to the caller (zap or direct player).
@@ -451,6 +639,11 @@ impl FoxkanesGame {
             }
             let animal_nft = create_resp.alkanes.0[0].clone();
             self.register_animal(&animal_nft.id);
+            // Record latest spawned animal id as two u128 cells.
+            self.latest_animal_id_block_pointer()
+                .set_value(animal_nft.id.block);
+            self.latest_animal_id_tx_pointer()
+                .set_value(animal_nft.id.tx);
             self.animal_seq_pointer().set_value(animal_id_seq + 1);
             self.total_animals_minted_pointer()
                 .set_value(self.total_animals_minted_pointer().get_value::<u128>() + 1);
@@ -481,7 +674,289 @@ impl FoxkanesGame {
         Ok(response)
     }
 
+    // ── Staking and claim handlers ──────────────────────────────
+
+    /// Authenticate that an animal NFT is present in incoming_alkanes,
+    /// registered as our child, alive, and (optionally) in the expected
+    /// staked-state. Returns the AlkaneId of the verified animal.
+    fn authenticate_animal(&self, want_staked: bool) -> Result<AlkaneId> {
+        let context = self.context()?;
+        let xfer = context
+            .incoming_alkanes
+            .0
+            .iter()
+            .find(|t| t.value >= 1 && self.is_registered_animal(&t.id))
+            .ok_or_else(|| anyhow!("no registered animal in incoming alkanes"))?;
+        let id = xfer.id.clone();
+
+        let (_animal_id, _role, _birth, _lifespan, _taxes, _last_claim, is_dead, _hunt) =
+            self.read_animal(&id)?;
+        if is_dead != 0 {
+            return Err(anyhow!("animal is dead"));
+        }
+        let staked_now = self.is_staked(&id);
+        if want_staked && !staked_now {
+            return Err(anyhow!("animal must be staked for this op"));
+        }
+        if !want_staked && staked_now {
+            return Err(anyhow!("animal is already staked"));
+        }
+        Ok(id)
+    }
+
+    fn stake(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let id = self.authenticate_animal(false)?;
+        let (_animal_id, role, _birth, _lifespan, _taxes, _last_claim, _dead, _hunt) =
+            self.read_animal(&id)?;
+        let current_height = self.height() as u128;
+
+        // Reset the yield checkpoint to the stake block so future yield
+        // accrues from now on.
+        self.write_animal_last_claim(&id, current_height)?;
+        self.animal_staked_pointer(&id).set_value(1u128);
+
+        // Update population & fox-pool checkpoints by role.
+        if role == 1 {
+            // Fox just staked: snapshot the current accumulator so they
+            // only earn tax distributed after this point.
+            let acc = self.tax_per_fox_acc();
+            self.fox_acc_checkpoint_pointer(&id).set_value(acc);
+            self.staked_fox_count_pointer()
+                .set_value(self.staked_fox_count() + 1);
+        } else {
+            self.staked_farmer_count_pointer()
+                .set_value(self.staked_farmer_count() + 1);
+        }
+
+        // Return the NFT (bearer-token preserved).
+        let mut response = CallResponse::default();
+        response.alkanes.0.extend(context.incoming_alkanes.0.iter().cloned());
+        Ok(response)
+    }
+
+    /// Compute pre-tax yield owed to an animal between `last_claim_block`
+    /// and `current_height`, using TEST_YIELD_PER_BLOCK_PER_STAKE.
+    fn compute_yield_units(&self, last_claim_block: u128) -> u128 {
+        let current_height = self.height() as u128;
+        if current_height <= last_claim_block {
+            return 0;
+        }
+        let elapsed = current_height - last_claim_block;
+        elapsed.saturating_mul(TEST_YIELD_PER_BLOCK_PER_STAKE)
+    }
+
+    /// Distribute tax to the fox pool by bumping the per-fox accumulator.
+    /// Splits tax across all currently-staked foxes evenly via the
+    /// Synthetix `tax_per_fox_acc += tax × PRECISION / fox_count` pattern.
+    /// If no foxes are staked, the tax accrues to the pool balance but
+    /// without contributing to the accumulator — foxes who stake later
+    /// won't see this tax via their checkpoint; instead it's claimable
+    /// via a fallback the contract reserves for the first fox to stake
+    /// after a "no-fox" period. For v0 simplicity we floor at 1: if zero
+    /// foxes staked, all tax routes to lifetime + balance and the
+    /// accumulator stays untouched. Foxes who stake later only earn
+    /// from taxes paid *after* their stake.
+    fn distribute_tax_to_foxes(&self, tax: u128) {
+        if tax == 0 {
+            return;
+        }
+        let fox_count = self.staked_fox_count();
+        if fox_count > 0 {
+            let acc = self.tax_per_fox_acc();
+            let add = tax
+                .saturating_mul(PRECISION)
+                .checked_div(fox_count)
+                .unwrap_or(0);
+            self.tax_per_fox_acc_pointer().set_value(acc.saturating_add(add));
+        }
+        self.fox_pool_balance_pointer()
+            .set_value(self.fox_pool_balance().saturating_add(tax));
+        self.fox_pool_lifetime_pointer()
+            .set_value(self.fox_pool_lifetime().saturating_add(tax));
+    }
+
+    /// Compute the tax owed to the fox pool when a farmer claims `yield`.
+    /// Uses the homeostatic compute_tax_bps with current population.
+    fn farmer_tax_owed(&self, yield_units: u128) -> u128 {
+        let bps = compute_tax_bps(self.fox_count(), self.farmer_count());
+        yield_units.saturating_mul(bps).checked_div(BPS).unwrap_or(0)
+    }
+
+    /// Withdraw a fox's accumulated share from the per-fox accumulator,
+    /// updating their checkpoint and decrementing the pool balance.
+    fn fox_claim_share(&self, id: &AlkaneId) -> u128 {
+        let acc = self.tax_per_fox_acc();
+        let ck = self.fox_acc_checkpoint(id);
+        if acc <= ck {
+            return 0;
+        }
+        let diff = acc - ck;
+        // share = diff / PRECISION  (units returned to the fox)
+        let share = diff.checked_div(PRECISION).unwrap_or(0);
+        self.fox_acc_checkpoint_pointer(id).set_value(acc);
+        let bal = self.fox_pool_balance();
+        self.fox_pool_balance_pointer()
+            .set_value(bal.saturating_sub(share));
+        share
+    }
+
+    fn claim_safe(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let id = self.authenticate_animal(true)?;
+        let (_aid, role, _birth, _lifespan, _taxes, last_claim, _dead, _hunt) =
+            self.read_animal(&id)?;
+
+        let current_height = self.height() as u128;
+        let mut payout: u128 = 0;
+
+        if role == 0 {
+            // Farmer: compute yield, deduct homeostatic tax, route tax to
+            // fox pool, payout remainder.
+            let yield_units = self.compute_yield_units(last_claim);
+            let tax = self.farmer_tax_owed(yield_units);
+            self.distribute_tax_to_foxes(tax);
+            payout = yield_units.saturating_sub(tax);
+        } else {
+            // Fox: claim their share of the accumulator + any direct
+            // yield (a fox earns the same per-block yield as a farmer in
+            // v0 — production may differ, but symmetry simplifies tests).
+            let direct = self.compute_yield_units(last_claim);
+            let pool_share = self.fox_claim_share(&id);
+            payout = direct.saturating_add(pool_share);
+        }
+
+        self.write_animal_last_claim(&id, current_height)?;
+
+        // Return the NFT, plus a synthetic yield representation in
+        // response.data (16 LE bytes = u128) so callers/tests can read
+        // the payout amount. Real yield-token mints will replace this in
+        // the FIRE-integrated production path.
+        let mut response = CallResponse::default();
+        response.alkanes.0.extend(context.incoming_alkanes.0.iter().cloned());
+        response.data = payout.to_le_bytes().to_vec();
+        Ok(response)
+    }
+
+    fn claim_risky(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let id = self.authenticate_animal(true)?;
+        let (animal_id, role, _birth, _lifespan, _taxes, last_claim, _dead, _hunt) =
+            self.read_animal(&id)?;
+
+        let current_height = self.height() as u128;
+        // Same seed derivation pattern as the lottery, salted distinctly.
+        let seed_input = animal_id.wrapping_add(RISKY_CLAIM_SALT);
+        let seed = self.derive_seed(seed_input, current_height);
+        let roll = seed % BPS;
+        let keep = roll < RISKY_KEEP_PROBABILITY_BPS;
+
+        let mut payout: u128 = 0;
+        if role == 0 {
+            let yield_units = self.compute_yield_units(last_claim);
+            if keep {
+                // Win: keep the full pre-tax yield. Fox pool gets nothing.
+                payout = yield_units;
+            } else {
+                // Loss: entire yield routes to fox pool.
+                self.distribute_tax_to_foxes(yield_units);
+                payout = 0;
+            }
+        } else {
+            // Foxes can also use ClaimRisky on their direct yield, but
+            // the variance only applies to direct yield; their accumulator
+            // share is independent (it's already a coupon, not at risk).
+            let direct = self.compute_yield_units(last_claim);
+            let pool_share = self.fox_claim_share(&id);
+            if keep {
+                payout = direct.saturating_add(pool_share);
+            } else {
+                // Loss on a fox's risky: direct yield burns to the fox pool
+                // (other foxes get the upside). Pool share still pays out.
+                self.distribute_tax_to_foxes(direct);
+                payout = pool_share;
+            }
+        }
+
+        self.write_animal_last_claim(&id, current_height)?;
+        let mut response = CallResponse::default();
+        response.alkanes.0.extend(context.incoming_alkanes.0.iter().cloned());
+        response.data = payout.to_le_bytes().to_vec();
+        Ok(response)
+    }
+
     // ── View handlers ────────────────────────────────────────────
+
+    fn get_fox_pool(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        response.data = self.fox_pool_balance().to_le_bytes().to_vec();
+        Ok(response)
+    }
+
+    fn get_fox_pool_lifetime(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        response.data = self.fox_pool_lifetime().to_le_bytes().to_vec();
+        Ok(response)
+    }
+
+    fn preview_yield(&self, animal_block: u128, animal_tx: u128) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        let id = AlkaneId {
+            block: animal_block,
+            tx: animal_tx,
+        };
+        let units = if self.is_registered_animal(&id) {
+            let (_a, _r, _b, _l, _t, last_claim, _d, _h) = self.read_animal(&id)?;
+            self.compute_yield_units(last_claim)
+        } else {
+            0
+        };
+        response.data = units.to_le_bytes().to_vec();
+        Ok(response)
+    }
+
+    fn get_latest_animal_id(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        let mut data = Vec::with_capacity(32);
+        data.extend_from_slice(
+            &self
+                .latest_animal_id_block_pointer()
+                .get_value::<u128>()
+                .to_le_bytes(),
+        );
+        data.extend_from_slice(
+            &self
+                .latest_animal_id_tx_pointer()
+                .get_value::<u128>()
+                .to_le_bytes(),
+        );
+        response.data = data;
+        Ok(response)
+    }
+
+    fn get_latest_commitment_id(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        let mut data = Vec::with_capacity(32);
+        data.extend_from_slice(
+            &self
+                .latest_commitment_id_block_pointer()
+                .get_value::<u128>()
+                .to_le_bytes(),
+        );
+        data.extend_from_slice(
+            &self
+                .latest_commitment_id_tx_pointer()
+                .get_value::<u128>()
+                .to_le_bytes(),
+        );
+        response.data = data;
+        Ok(response)
+    }
 
     fn get_population(&self) -> Result<CallResponse> {
         let context = self.context()?;
