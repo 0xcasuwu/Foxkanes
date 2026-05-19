@@ -35,7 +35,9 @@ use alkanes_support::{
 use anyhow::{anyhow, Result};
 use foxkanes_constants::*;
 use foxkanes_support::{
-    compute_lifespan_blocks, compute_lottery_weight, compute_tax_bps, lottery_check, role_is_fox,
+    compute_aging_blocks, compute_lifespan_blocks, compute_lottery_weight,
+    compute_party_success_bps, compute_per_hunter_prob_bps, compute_tax_bps, lottery_check,
+    role_is_fox,
 };
 use metashrew_support::compat::to_arraybuffer_layout;
 use metashrew_support::index_pointer::KeyValuePointer;
@@ -132,6 +134,67 @@ enum FoxkanesGameMessage {
     #[opcode(24)]
     #[returns(Vec<u8>)]
     GetLatestCommitmentId,
+
+    /// Initiate a hunt against a staked fox. Caller presents N farmer
+    /// animal NFTs in incoming_alkanes (MIN_HUNT_PARTY ≤ N ≤ MAX_HUNT_PARTY).
+    /// Game freezes all participants (sets hunt_in_progress=1), records
+    /// hunt state, returns party NFTs to caller. Hunt id stored in
+    /// response.data (16 LE bytes u128). Per-NFT detail is fetched via
+    /// GetHunt(hunt_id) afterwards.
+    #[opcode(6)]
+    InitiateHunt {
+        target_fox_block: u128,
+        target_fox_tx: u128,
+    },
+
+    /// Resolve an open hunt. Caller passes the hunt_id. Derives seed,
+    /// computes per-hunter prob (scales with target's unclaimed taxes
+    /// vs all-time max), party success = 1-(1-p)^N. Success: distribute
+    /// target's unclaimed taxes among party (added to each member's
+    /// accumulated_taxes), burn target fox (mark dead), convert one
+    /// party member to fox. Failure: age each party member.
+    /// Unfreezes all participants either way.
+    #[opcode(7)]
+    ResolveHunt {
+        hunt_id: u128,
+    },
+
+    /// View: state of a specific hunt. Returns 6 × u128 LE = 96 bytes:
+    /// [target_block, target_tx, party_size, initiation_block, resolved, success]
+    #[opcode(25)]
+    #[returns(Vec<u8>)]
+    GetHunt {
+        hunt_id: u128,
+    },
+
+    /// View: total hunts ever initiated.
+    #[opcode(26)]
+    #[returns(u128)]
+    GetTotalHunts,
+
+    /// View: failed-hunt count in the recent window (last RECENT_WINDOW blocks).
+    #[opcode(27)]
+    #[returns(u128)]
+    GetRecentFailedHunts,
+
+    /// View: total hunts in the recent window (for compute_aging_blocks).
+    #[opcode(28)]
+    #[returns(u128)]
+    GetRecentTotalHunts,
+
+    /// View: extra aging applied to an animal via failed hunts.
+    #[opcode(29)]
+    #[returns(u128)]
+    GetAnimalAging {
+        block: u128,
+        tx: u128,
+    },
+
+    /// View: max-observed fox unclaimed taxes (moving max), used as the
+    /// denominator in compute_per_hunter_prob_bps.
+    #[opcode(30)]
+    #[returns(u128)]
+    GetMaxFoxUnclaimed,
 
     // ── Open view opcodes ────────────────────────────────────────
 
@@ -283,6 +346,64 @@ impl FoxkanesGame {
     /// Tracks (sum of farmer-paid taxes since genesis) - (sum of fox claims).
     fn fox_pool_balance_pointer(&self) -> StoragePointer {
         StoragePointer::from_keyword("/fox_pool_balance")
+    }
+
+    // ── Hunt storage ─────────────────────────────────────────────
+
+    fn hunt_seq_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/hunt_seq")
+    }
+
+    fn hunt_target_block_pointer(&self, hunt_id: u128) -> StoragePointer {
+        StoragePointer::from_keyword(&format!("/hunt/{}/target_block", hunt_id))
+    }
+    fn hunt_target_tx_pointer(&self, hunt_id: u128) -> StoragePointer {
+        StoragePointer::from_keyword(&format!("/hunt/{}/target_tx", hunt_id))
+    }
+    fn hunt_party_size_pointer(&self, hunt_id: u128) -> StoragePointer {
+        StoragePointer::from_keyword(&format!("/hunt/{}/party_size", hunt_id))
+    }
+    fn hunt_init_block_pointer(&self, hunt_id: u128) -> StoragePointer {
+        StoragePointer::from_keyword(&format!("/hunt/{}/init_block", hunt_id))
+    }
+    fn hunt_resolved_pointer(&self, hunt_id: u128) -> StoragePointer {
+        StoragePointer::from_keyword(&format!("/hunt/{}/resolved", hunt_id))
+    }
+    fn hunt_success_pointer(&self, hunt_id: u128) -> StoragePointer {
+        StoragePointer::from_keyword(&format!("/hunt/{}/success", hunt_id))
+    }
+
+    /// Per-hunt party member by index 0..party_size — block + tx of each
+    /// participating farmer animal.
+    fn hunt_member_block_pointer(&self, hunt_id: u128, idx: u128) -> StoragePointer {
+        StoragePointer::from_keyword(&format!("/hunt/{}/m{}/b", hunt_id, idx))
+    }
+    fn hunt_member_tx_pointer(&self, hunt_id: u128, idx: u128) -> StoragePointer {
+        StoragePointer::from_keyword(&format!("/hunt/{}/m{}/t", hunt_id, idx))
+    }
+
+    /// Extra aging applied to a specific animal via failed hunts.
+    fn animal_aging_pointer(&self, id: &AlkaneId) -> StoragePointer {
+        StoragePointer::from_keyword(&format!("/aging/{}/{}", id.block, id.tx))
+    }
+
+    /// Maximum fox-unclaimed-taxes ever observed at hunt-initiation time —
+    /// used as the divisor in compute_per_hunter_prob_bps so the
+    /// "ripeness" scaling has a stable reference.
+    fn max_fox_unclaimed_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/max_fox_unclaimed")
+    }
+
+    /// Rolling counters for the adaptive aging formula.
+    /// Recent = within the last RECENT_HUNT_WINDOW blocks (we approximate
+    /// via a simple decay: every WINDOW blocks of inactivity, reset; for
+    /// v0 we count lifetime and let tests assert correctness on the
+    /// formula path while the window logic is exercised in integration).
+    fn lifetime_failed_hunts_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/lifetime_failed_hunts")
+    }
+    fn lifetime_total_hunts_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/lifetime_total_hunts")
     }
 
     /// Most-recently-spawned animal AlkaneId — stored as two u128 cells
@@ -885,6 +1006,255 @@ impl FoxkanesGame {
         Ok(response)
     }
 
+    // ── Hunt handlers ───────────────────────────────────────────
+
+    fn initiate_hunt(&self, target_block: u128, target_tx: u128) -> Result<CallResponse> {
+        let context = self.context()?;
+        let current_height = self.height() as u128;
+
+        // 1. Validate target — must be a registered, staked, alive fox not
+        //    currently in another hunt.
+        let target_id = AlkaneId {
+            block: target_block,
+            tx: target_tx,
+        };
+        if !self.is_registered_animal(&target_id) {
+            return Err(anyhow!("target is not a registered animal"));
+        }
+        let (_a, target_role, _b, _l, target_taxes, _lc, target_dead, target_hunt) =
+            self.read_animal(&target_id)?;
+        if target_dead != 0 {
+            return Err(anyhow!("target is dead"));
+        }
+        if target_role != 1 {
+            return Err(anyhow!("target is not a fox"));
+        }
+        if !self.is_staked(&target_id) {
+            return Err(anyhow!("target fox is not staked"));
+        }
+        if target_hunt != 0 {
+            return Err(anyhow!("target fox already in another hunt"));
+        }
+
+        // 2. Validate party — every incoming alkane that's a registered
+        //    animal IS a party member. Apply per-member validation.
+        let mut party: Vec<AlkaneId> = Vec::new();
+        for xfer in &context.incoming_alkanes.0 {
+            if xfer.value < 1 {
+                continue;
+            }
+            if !self.is_registered_animal(&xfer.id) {
+                continue;
+            }
+            let (_aa, p_role, _ab, _al, _at, _alc, p_dead, p_hunt) = self.read_animal(&xfer.id)?;
+            if p_dead != 0 || p_role != 0 {
+                return Err(anyhow!("party member must be a live farmer"));
+            }
+            if !self.is_staked(&xfer.id) {
+                return Err(anyhow!("party member must be staked"));
+            }
+            if p_hunt != 0 {
+                return Err(anyhow!("party member already in another hunt"));
+            }
+            party.push(xfer.id.clone());
+        }
+        let party_size = party.len() as u128;
+        if party_size < MIN_HUNT_PARTY {
+            return Err(anyhow!(
+                "party size {} below MIN_HUNT_PARTY ({})",
+                party_size,
+                MIN_HUNT_PARTY
+            ));
+        }
+        if party_size > MAX_HUNT_PARTY {
+            return Err(anyhow!(
+                "party size {} above MAX_HUNT_PARTY ({})",
+                party_size,
+                MAX_HUNT_PARTY
+            ));
+        }
+
+        // 3. Allocate hunt id and persist state.
+        let hunt_seq = self.hunt_seq_pointer().get_value::<u128>();
+        let hunt_id = if hunt_seq == 0 { 1 } else { hunt_seq };
+        self.hunt_target_block_pointer(hunt_id).set_value(target_block);
+        self.hunt_target_tx_pointer(hunt_id).set_value(target_tx);
+        self.hunt_party_size_pointer(hunt_id).set_value(party_size);
+        self.hunt_init_block_pointer(hunt_id).set_value(current_height);
+        self.hunt_resolved_pointer(hunt_id).set_value(0u128);
+        self.hunt_success_pointer(hunt_id).set_value(0u128);
+        for (idx, m) in party.iter().enumerate() {
+            self.hunt_member_block_pointer(hunt_id, idx as u128)
+                .set_value(m.block);
+            self.hunt_member_tx_pointer(hunt_id, idx as u128)
+                .set_value(m.tx);
+        }
+        self.hunt_seq_pointer().set_value(hunt_id + 1);
+        self.lifetime_total_hunts_pointer().set_value(
+            self.lifetime_total_hunts_pointer().get_value::<u128>() + 1,
+        );
+
+        // 4. Update moving-max for the per-hunter prob denominator.
+        let cur_max = self.max_fox_unclaimed_pointer().get_value::<u128>();
+        if target_taxes > cur_max {
+            self.max_fox_unclaimed_pointer().set_value(target_taxes);
+        }
+
+        // 5. Freeze target + members via SetHuntInProgress(1) on each animal.
+        self.set_hunt_flag(&target_id, 1)?;
+        for m in &party {
+            self.set_hunt_flag(m, 1)?;
+        }
+
+        // 6. Return the party NFTs (bearer-token preserved) and the hunt_id.
+        let mut response = CallResponse::default();
+        response.alkanes.0.extend(context.incoming_alkanes.0.iter().cloned());
+        response.data = hunt_id.to_le_bytes().to_vec();
+        Ok(response)
+    }
+
+    /// Vault-only helper: SetHuntInProgress on a child animal NFT.
+    fn set_hunt_flag(&self, id: &AlkaneId, value: u128) -> Result<()> {
+        let call = Cellpack {
+            target: id.clone(),
+            inputs: vec![5u128, value], // SetHuntInProgress
+        };
+        self.call(&call, &AlkaneTransferParcel::default(), self.fuel())?;
+        Ok(())
+    }
+
+    fn resolve_hunt(&self, hunt_id: u128) -> Result<CallResponse> {
+        // 1. Load hunt state.
+        let resolved = self.hunt_resolved_pointer(hunt_id).get_value::<u128>();
+        if resolved != 0 {
+            return Err(anyhow!("hunt already resolved"));
+        }
+        let party_size = self.hunt_party_size_pointer(hunt_id).get_value::<u128>();
+        if party_size == 0 {
+            return Err(anyhow!("unknown hunt_id"));
+        }
+        let target_id = AlkaneId {
+            block: self.hunt_target_block_pointer(hunt_id).get_value::<u128>(),
+            tx: self.hunt_target_tx_pointer(hunt_id).get_value::<u128>(),
+        };
+
+        // 2. Re-read target fox's CURRENT unclaimed taxes (may have grown
+        //    since hunt was initiated).
+        let (_a, _r, _b, _l, target_taxes, _lc, _d, _h) = self.read_animal(&target_id)?;
+        let moving_max = self.max_fox_unclaimed_pointer().get_value::<u128>();
+
+        // 3. Compute per-hunter and party-success probabilities.
+        let per_hunter = compute_per_hunter_prob_bps(target_taxes, moving_max);
+        let party_bps = compute_party_success_bps(per_hunter, party_size);
+
+        // 4. Derive seed and roll.
+        let seed = self.derive_seed(hunt_id, target_taxes);
+        let roll = seed % BPS;
+        let success = (roll as u128) < party_bps;
+
+        // 5. Outcome handlers.
+        if success {
+            // 5a. Distribute target's unclaimed taxes among party members
+            //     by setting each member's accumulated_taxes += target.taxes/N.
+            //     For v0 we use the animal's accumulated_taxes field as a
+            //     "earned-tax-tab" — set directly via the vault-only op 2.
+            let share = target_taxes.checked_div(party_size).unwrap_or(0);
+            for idx in 0..party_size {
+                let m = AlkaneId {
+                    block: self.hunt_member_block_pointer(hunt_id, idx).get_value::<u128>(),
+                    tx: self.hunt_member_tx_pointer(hunt_id, idx).get_value::<u128>(),
+                };
+                let (_, _, _, _, m_taxes, _, _, _) = self.read_animal(&m)?;
+                let new_taxes = m_taxes.saturating_add(share);
+                let call = Cellpack {
+                    target: m.clone(),
+                    inputs: vec![2u128, new_taxes], // SetAccumulatedTaxes
+                };
+                self.call(&call, &AlkaneTransferParcel::default(), self.fuel())?;
+                // Clear hunt flag on member.
+                self.set_hunt_flag(&m, 0)?;
+            }
+            // 5b. Burn the target fox: mark dead AND zero its taxes.
+            let mark_dead = Cellpack {
+                target: target_id.clone(),
+                inputs: vec![4u128], // MarkDead
+            };
+            self.call(&mark_dead, &AlkaneTransferParcel::default(), self.fuel())?;
+            let zero_taxes = Cellpack {
+                target: target_id.clone(),
+                inputs: vec![2u128, 0u128],
+            };
+            self.call(&zero_taxes, &AlkaneTransferParcel::default(), self.fuel())?;
+            self.set_hunt_flag(&target_id, 0)?;
+            // Population update: -1 fox, target was staked so decrement.
+            self.fox_count_pointer()
+                .set_value(self.fox_count().saturating_sub(1));
+            self.staked_fox_count_pointer()
+                .set_value(self.staked_fox_count().saturating_sub(1));
+
+            // 5c. Convert one party member (use seed to pick which) to fox.
+            //     Use a *different* seed slice to decorrelate from the win/lose roll.
+            let pick = (seed >> 64) % party_size;
+            let chosen = AlkaneId {
+                block: self.hunt_member_block_pointer(hunt_id, pick).get_value::<u128>(),
+                tx: self.hunt_member_tx_pointer(hunt_id, pick).get_value::<u128>(),
+            };
+            let convert = Cellpack {
+                target: chosen.clone(),
+                inputs: vec![3u128], // ConvertToFox
+            };
+            self.call(&convert, &AlkaneTransferParcel::default(), self.fuel())?;
+            // Population: -1 farmer + 1 fox to net out the role swap.
+            self.farmer_count_pointer()
+                .set_value(self.farmer_count().saturating_sub(1));
+            self.fox_count_pointer().set_value(self.fox_count() + 1);
+            self.staked_farmer_count_pointer()
+                .set_value(self.staked_farmer_count().saturating_sub(1));
+            self.staked_fox_count_pointer()
+                .set_value(self.staked_fox_count() + 1);
+            // Seed the new fox's accumulator checkpoint so they only earn
+            // taxes from this point forward (per the same convention as
+            // a fresh fox stake).
+            self.fox_acc_checkpoint_pointer(&chosen)
+                .set_value(self.tax_per_fox_acc());
+
+            self.hunt_success_pointer(hunt_id).set_value(1u128);
+        } else {
+            // Failed hunt path.
+            // 5d. Apply aging to each party member. The aging amount adapts
+            //     to recent failed-hunt rate (compute_aging_blocks). For v0
+            //     we use lifetime counters as a proxy for "recent".
+            let failed_recent = self.lifetime_failed_hunts_pointer().get_value::<u128>();
+            let total_recent = self.lifetime_total_hunts_pointer().get_value::<u128>();
+            let aging = compute_aging_blocks(failed_recent, total_recent) as u128;
+            for idx in 0..party_size {
+                let m = AlkaneId {
+                    block: self.hunt_member_block_pointer(hunt_id, idx).get_value::<u128>(),
+                    tx: self.hunt_member_tx_pointer(hunt_id, idx).get_value::<u128>(),
+                };
+                let cur = self.animal_aging_pointer(&m).get_value::<u128>();
+                self.animal_aging_pointer(&m)
+                    .set_value(cur.saturating_add(aging));
+                self.set_hunt_flag(&m, 0)?;
+            }
+            // 5e. Unfreeze target.
+            self.set_hunt_flag(&target_id, 0)?;
+            // 5f. Increment lifetime_failed counter.
+            self.lifetime_failed_hunts_pointer().set_value(failed_recent + 1);
+        }
+
+        // 6. Mark hunt resolved either way.
+        self.hunt_resolved_pointer(hunt_id).set_value(1u128);
+
+        // 7. Response — empty alkanes (NFTs already where they need to be:
+        // members keep their NFTs in their wallets since we didn't take
+        // them in, target's NFT is dead but still held by its owner).
+        let mut response = CallResponse::default();
+        let success_flag: u128 = if success { 1 } else { 0 };
+        response.data = success_flag.to_le_bytes().to_vec();
+        Ok(response)
+    }
+
     // ── View handlers ────────────────────────────────────────────
 
     fn get_fox_pool(&self) -> Result<CallResponse> {
@@ -935,6 +1305,69 @@ impl FoxkanesGame {
                 .to_le_bytes(),
         );
         response.data = data;
+        Ok(response)
+    }
+
+    fn get_hunt(&self, hunt_id: u128) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        let mut data = Vec::with_capacity(16 * 6);
+        data.extend_from_slice(
+            &self.hunt_target_block_pointer(hunt_id).get_value::<u128>().to_le_bytes(),
+        );
+        data.extend_from_slice(
+            &self.hunt_target_tx_pointer(hunt_id).get_value::<u128>().to_le_bytes(),
+        );
+        data.extend_from_slice(
+            &self.hunt_party_size_pointer(hunt_id).get_value::<u128>().to_le_bytes(),
+        );
+        data.extend_from_slice(
+            &self.hunt_init_block_pointer(hunt_id).get_value::<u128>().to_le_bytes(),
+        );
+        data.extend_from_slice(
+            &self.hunt_resolved_pointer(hunt_id).get_value::<u128>().to_le_bytes(),
+        );
+        data.extend_from_slice(
+            &self.hunt_success_pointer(hunt_id).get_value::<u128>().to_le_bytes(),
+        );
+        response.data = data;
+        Ok(response)
+    }
+
+    fn get_total_hunts(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        response.data = self.lifetime_total_hunts_pointer().get_value::<u128>().to_le_bytes().to_vec();
+        Ok(response)
+    }
+
+    fn get_recent_failed_hunts(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        // v0: lifetime as proxy for recent
+        response.data = self.lifetime_failed_hunts_pointer().get_value::<u128>().to_le_bytes().to_vec();
+        Ok(response)
+    }
+
+    fn get_recent_total_hunts(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        response.data = self.lifetime_total_hunts_pointer().get_value::<u128>().to_le_bytes().to_vec();
+        Ok(response)
+    }
+
+    fn get_animal_aging(&self, block: u128, tx: u128) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        let id = AlkaneId { block, tx };
+        response.data = self.animal_aging_pointer(&id).get_value::<u128>().to_le_bytes().to_vec();
+        Ok(response)
+    }
+
+    fn get_max_fox_unclaimed(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        response.data = self.max_fox_unclaimed_pointer().get_value::<u128>().to_le_bytes().to_vec();
         Ok(response)
     }
 

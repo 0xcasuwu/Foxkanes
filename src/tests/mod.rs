@@ -7,3 +7,4 @@ pub mod animal_test;
 pub mod commitment_test;
 pub mod game_test;
 pub mod gameplay_test;
+pub mod hunts_test;
