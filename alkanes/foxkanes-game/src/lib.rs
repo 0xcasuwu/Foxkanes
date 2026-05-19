@@ -196,6 +196,39 @@ enum FoxkanesGameMessage {
     #[returns(u128)]
     GetMaxFoxUnclaimed,
 
+    /// Permissionless expiration cleanup. Anyone can call Expire(animal_id)
+    /// once the animal's effective lifespan has elapsed:
+    ///   `current_height >= birth_block + lifespan_blocks - animal_aging[id]`
+    /// On expiration:
+    ///   - animal marked dead
+    ///   - population counters decremented (and staked counters if applicable)
+    ///   - hunt-pending check: error if hunt_in_progress=1
+    ///   - returns a bounty record in response.data
+    /// The bounty is a u128 value computed from on-chain state (currently
+    /// a fixed token from RewardBounty in v0, scaling-with-treasury in
+    /// later versions). For testability we expose a fixed
+    /// EXPIRE_BOUNTY constant.
+    #[opcode(8)]
+    Expire {
+        animal_block: u128,
+        animal_tx: u128,
+    },
+
+    /// View: effective lifespan-end block for an animal, accounting for
+    /// extra_aging applied via failed hunts. Returns the block at which
+    /// Expire becomes callable. Inputs: (block, tx).
+    #[opcode(31)]
+    #[returns(u128)]
+    GetExpireBlock {
+        block: u128,
+        tx: u128,
+    },
+
+    /// View: total expirations processed lifetime.
+    #[opcode(32)]
+    #[returns(u128)]
+    GetTotalExpirations,
+
     // ── Open view opcodes ────────────────────────────────────────
 
     /// (fox_count, farmer_count) as 2 × u128 LE = 32 bytes
@@ -404,6 +437,10 @@ impl FoxkanesGame {
     }
     fn lifetime_total_hunts_pointer(&self) -> StoragePointer {
         StoragePointer::from_keyword("/lifetime_total_hunts")
+    }
+
+    fn total_expirations_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/total_expirations")
     }
 
     /// Most-recently-spawned animal AlkaneId — stored as two u128 cells
@@ -1255,7 +1292,94 @@ impl FoxkanesGame {
         Ok(response)
     }
 
+    // ── Expiration handler ──────────────────────────────────────
+
+    fn expire(&self, animal_block: u128, animal_tx: u128) -> Result<CallResponse> {
+        let id = AlkaneId {
+            block: animal_block,
+            tx: animal_tx,
+        };
+        if !self.is_registered_animal(&id) {
+            return Err(anyhow!("animal not registered"));
+        }
+        let (_aid, role, birth, lifespan, _taxes, _last_claim, is_dead, hunt_flag) =
+            self.read_animal(&id)?;
+        if is_dead != 0 {
+            return Err(anyhow!("animal already dead"));
+        }
+        if hunt_flag != 0 {
+            return Err(anyhow!("cannot expire an animal in pending hunt"));
+        }
+        let current_height = self.height() as u128;
+        let aging = self.animal_aging_pointer(&id).get_value::<u128>();
+        let nominal_end = birth.saturating_add(lifespan);
+        let effective_end = nominal_end.saturating_sub(aging);
+        if current_height < effective_end {
+            return Err(anyhow!(
+                "too early to expire: current {} < effective_end {}",
+                current_height,
+                effective_end
+            ));
+        }
+
+        // Mark dead on the animal NFT.
+        let mark_dead = Cellpack {
+            target: id.clone(),
+            inputs: vec![4u128], // MarkDead
+        };
+        self.call(&mark_dead, &AlkaneTransferParcel::default(), self.fuel())?;
+
+        // Decrement population.
+        if role == 1 {
+            self.fox_count_pointer()
+                .set_value(self.fox_count().saturating_sub(1));
+            if self.is_staked(&id) {
+                self.staked_fox_count_pointer()
+                    .set_value(self.staked_fox_count().saturating_sub(1));
+            }
+        } else {
+            self.farmer_count_pointer()
+                .set_value(self.farmer_count().saturating_sub(1));
+            if self.is_staked(&id) {
+                self.staked_farmer_count_pointer()
+                    .set_value(self.staked_farmer_count().saturating_sub(1));
+            }
+        }
+        // Lifetime counter.
+        self.total_expirations_pointer()
+            .set_value(self.total_expirations_pointer().get_value::<u128>() + 1);
+
+        // Return the bounty as a u128 in response.data — in production
+        // this routes to whatever yield-token the game has access to;
+        // for v0 we surface it as a number for callers to verify.
+        let mut response = CallResponse::default();
+        response.data = EXPIRE_BOUNTY_UNITS.to_le_bytes().to_vec();
+        Ok(response)
+    }
+
     // ── View handlers ────────────────────────────────────────────
+
+    fn get_expire_block(&self, block: u128, tx: u128) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        let id = AlkaneId { block, tx };
+        let effective = if self.is_registered_animal(&id) {
+            let (_a, _r, birth, lifespan, _t, _lc, _d, _h) = self.read_animal(&id)?;
+            let aging = self.animal_aging_pointer(&id).get_value::<u128>();
+            birth.saturating_add(lifespan).saturating_sub(aging)
+        } else {
+            0
+        };
+        response.data = effective.to_le_bytes().to_vec();
+        Ok(response)
+    }
+
+    fn get_total_expirations(&self) -> Result<CallResponse> {
+        let context = self.context()?;
+        let mut response = CallResponse::forward(&context.incoming_alkanes);
+        response.data = self.total_expirations_pointer().get_value::<u128>().to_le_bytes().to_vec();
+        Ok(response)
+    }
 
     fn get_fox_pool(&self) -> Result<CallResponse> {
         let context = self.context()?;

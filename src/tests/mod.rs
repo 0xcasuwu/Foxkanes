@@ -8,3 +8,4 @@ pub mod commitment_test;
 pub mod game_test;
 pub mod gameplay_test;
 pub mod hunts_test;
+pub mod expire_test;

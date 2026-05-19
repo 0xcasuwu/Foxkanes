@@ -205,6 +205,13 @@ pub const TEST_YIELD_PER_BLOCK_PER_STAKE: u128 = 1_000;
 /// foxkanes-support to keep entropy clean.
 pub const RISKY_CLAIM_SALT: u128 = 0xC0FFEE_FACE_FEEDu128;
 
+/// V0 fixed bounty paid to the caller of Expire() for cleaning up an
+/// aged animal. In production this scales with treasury yield via
+/// BOUNTY_MULTIPLIER_*, but for testability and v0 deployment we use a
+/// constant value denominated in the same yield-units as
+/// TEST_YIELD_PER_BLOCK_PER_STAKE.
+pub const EXPIRE_BOUNTY_UNITS: u128 = 100;
+
 // ---------- Sanity / overflow protection ----------
 /// 1e8 — used for fixed-point math like fire-misha
 pub const PRECISION_SMALL: u128 = 100_000_000;
